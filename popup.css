@@ -1,0 +1,60 @@
+body {
+  width: 340px;
+  font-family: -apple-system, Segoe UI, Roboto, sans-serif;
+  margin: 0;
+  padding: 10px;
+  color: #222;
+}
+header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+header img { width: 20px; height: 20px; }
+h1 { font-size: 14px; margin: 0; }
+.status { font-size: 12px; color: #666; margin-bottom: 8px; }
+#video-list { list-style: none; margin: 0; padding: 0; max-height: 360px; overflow-y: auto; }
+.video-item {
+  border: 1px solid #e2e2e2;
+  border-radius: 6px;
+  padding: 8px;
+  margin-bottom: 6px;
+}
+.video-item .meta { font-size: 11px; color: #777; word-break: break-all; margin-bottom: 6px; }
+.video-item .tag {
+  display: inline-block;
+  font-size: 10px;
+  text-transform: uppercase;
+  background: #eef2ff;
+  color: #3448c5;
+  border-radius: 4px;
+  padding: 1px 6px;
+  margin-right: 6px;
+}
+button.download-btn {
+  width: 100%;
+  background: #d9534f;
+  color: white;
+  border: none;
+  border-radius: 4px;
+  padding: 6px 0;
+  font-size: 12px;
+  cursor: pointer;
+}
+button.download-btn:disabled { background: #aaa; cursor: default; }
+button.download-btn.error { background: #b23b3b; }
+.actions { display: flex; gap: 6px; }
+.actions .download-btn { flex: 1; width: auto; }
+button.ffmpeg-btn {
+  background: #fff;
+  color: #333;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  padding: 6px 8px;
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.cc-toggle { display: flex; align-items: center; gap: 3px; font-size: 12px; cursor: pointer; white-space: nowrap; }
+.empty { font-size: 12px; color: #888; text-align: center; padding: 20px 0; }
