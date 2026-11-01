@@ -40,10 +40,26 @@ function getTabMap(tabId) {
   return map;
 }
 
+/** @type {Map<number, number>} tabId -> percent of the download running for that tab */
+const activeProgress = new Map();
+
 function updateBadge(tabId) {
   const count = tabVideos.get(tabId)?.size || 0;
-  chrome.action.setBadgeText({ tabId, text: count ? String(count) : "" });
+  const pct = activeProgress.get(tabId);
+  chrome.action.setBadgeText({ tabId, text: pct != null ? `${pct}%` : count ? String(count) : "" });
   chrome.action.setBadgeBackgroundColor({ tabId, color: "#d9534f" });
+}
+
+// One place every download kind reports through: icon badge + the open popup.
+// percent null = finished/failed, back to the video count.
+function setProgress(tabId, percent) {
+  if (tabId == null) return;
+  const next = percent == null ? null : Math.min(100, Math.round(percent));
+  if ((activeProgress.get(tabId) ?? null) === next) return;
+  if (next == null) activeProgress.delete(tabId);
+  else activeProgress.set(tabId, next);
+  updateBadge(tabId);
+  chrome.runtime.sendMessage({ action: "downloadProgress", tabId, percent: next }).catch(() => {});
 }
 
 function upsertVideo(tabId, info) {
@@ -438,7 +454,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message.action === "captureProgress") {
     const tabId = sender.tab?.id;
-    if (tabId != null) chrome.action.setBadgeText({ tabId, text: `${message.percent}%` });
+    setProgress(tabId, message.percent);
     return;
   }
 
@@ -455,13 +471,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         console.error("[UVD] download failed:", err);
         notify("Download failed", err.message);
       })
-      .finally(() => updateBadge(job.tabId));
+      .finally(() => setProgress(job.tabId, null));
     return;
   }
 
   if (message.action === "downloadVideo") {
     console.log("[UVD] download requested:", message.video.type, message.video.url);
     handleDownload(message.tabId, message.video)
+      .finally(() => setProgress(message.tabId, null))
       .then((result) => {
         if (result?.pending) {
           notify(
@@ -541,6 +558,7 @@ function sanitizeFilename(name) {
 
 async function handleDownload(tabId, video) {
   const base = sanitizeFilename(tabTitles.get(tabId) || "video") + "_" + Date.now();
+  const onProgress = (percent) => setProgress(tabId, percent);
   const pageUrl = await getPageUrl(tabId);
   console.log("[UVD] using page URL for Referer spoof:", pageUrl);
 
@@ -587,36 +605,78 @@ async function handleDownload(tabId, video) {
       // subtitle) rendition URLs already resolved — go straight there
       // instead of re-fetching and re-picking from the master playlist.
       const { blob, ext } = video.videoUrl
-        ? await downloadHlsVariant(video.videoUrl, video.audioUrl || null, video.subtitleUrl || null, ensureRuleFor)
-        : await downloadHls(video.url, ensureRuleFor);
+        ? await downloadHlsVariant(video.videoUrl, video.audioUrl || null, video.subtitleUrl || null, ensureRuleFor, onProgress)
+        : await downloadHls(video.url, ensureRuleFor, onProgress);
       return downloadBlob(blob, `${base}.${ext}`);
     }
 
     // Separate video + audio files (Instagram/Facebook DASH) -> one MP4.
     if (video.audioUrl) {
-      const [videoBytes, audioBytes] = await Promise.all(
-        [video.url, video.audioUrl].map(async (u) => (await fetchOrThrow(u, { ensureRuleFor })).arrayBuffer())
-      );
+      const fractions = [0, 0];
+      const part = (i) => (f) => {
+        fractions[i] = f;
+        onProgress((fractions[0] + fractions[1]) * 45);
+      };
+      const [videoBytes, audioBytes] = await Promise.all([
+        fetchBlobWithProgress(video.url, ensureRuleFor, part(0)),
+        fetchBlobWithProgress(video.audioUrl, ensureRuleFor, part(1)),
+      ]);
+      onProgress(95);
       return downloadBlob(await muxTracks({ videoBytes, audioBytes }), `${base}.mp4`);
     }
 
     // Plain http(s) video file.
     await ensureRuleFor(video.url);
     const filename = `${base}.${guessExtension(video)}`;
+    let chromeId;
     try {
-      const chromeId = await new Promise((resolve, reject) => {
+      chromeId = await new Promise((resolve, reject) => {
         chrome.downloads.download({ url: video.url, filename, saveAs: true }, (id) => {
           if (chrome.runtime.lastError || !id) reject(new Error(chrome.runtime.lastError?.message || "download failed"));
           else resolve(id);
         });
       });
-      return { success: true, chromeDownloadId: chromeId };
     } catch (directErr) {
       // Fallback: fetch it ourselves (with cookies, since the service worker
       // doesn't send them cross-origin by default) and save the result.
-      const response = await fetchOrThrow(video.url, { ensureRuleFor });
-      return downloadBlob(await response.blob(), filename);
+      return downloadBlob(await fetchBlobWithProgress(video.url, ensureRuleFor, (f) => onProgress(f * 95)), filename);
     }
+    await waitForChromeDownload(chromeId, onProgress);
+    return { success: true, chromeDownloadId: chromeId };
+  });
+}
+
+// Reads a response body chunk by chunk so progress can be reported; falls
+// back to no progress when the server doesn't send Content-Length.
+async function fetchBlobWithProgress(url, ensureRuleFor, onFraction) {
+  const res = await fetchOrThrow(url, { ensureRuleFor });
+  const total = Number(res.headers.get("content-length")) || 0;
+  const chunks = [];
+  let got = 0;
+  const reader = res.body.getReader();
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    got += value.length;
+    if (total) onFraction(Math.min(1, got / total));
+  }
+  return new Blob(chunks);
+}
+
+// chrome.downloads has no progress event, so poll until it settles.
+function waitForChromeDownload(id, onProgress) {
+  return new Promise((resolve, reject) => {
+    const timer = setInterval(async () => {
+      const [d] = await chrome.downloads.search({ id });
+      if (d?.state === "in_progress") {
+        if (d.totalBytes > 0) onProgress((d.bytesReceived / d.totalBytes) * 100);
+        return;
+      }
+      clearInterval(timer);
+      if (d?.state === "complete") resolve();
+      else reject(new Error(d?.error || "The download did not complete."));
+    }, 500);
   });
 }
 
@@ -971,7 +1031,7 @@ async function downloadSubtitleTrack(subtitlePlaylistUrl, ensureRuleFor) {
 // (not a master) and returns it as a single concatenated byte array — a
 // valid standalone file if the playlist is self-contained, or one half of
 // an audio+video pair that still needs muxing.
-async function downloadMediaPlaylistTrack(mediaPlaylistUrl, ensureRuleFor, label) {
+async function downloadMediaPlaylistTrack(mediaPlaylistUrl, ensureRuleFor, label, onFraction) {
   console.log(`[UVD] fetching ${label} playlist:`, mediaPlaylistUrl);
   const text = await (await fetchOrThrow(mediaPlaylistUrl, { ensureRuleFor })).text();
 
@@ -1004,6 +1064,7 @@ async function downloadMediaPlaylistTrack(mediaPlaylistUrl, ensureRuleFor, label
       const res = await fetchOrThrow(segmentUrls[i], { ensureRuleFor });
       parts[initSegmentUrl ? i + 1 : i] = await res.arrayBuffer();
       completed++;
+      onFraction?.(completed / segmentUrls.length);
       if (completed % 10 === 0 || completed === segmentUrls.length) {
         console.log(`[UVD] ${label} progress: ${completed}/${segmentUrls.length}`);
       }
@@ -1026,13 +1087,22 @@ async function downloadMediaPlaylistTrack(mediaPlaylistUrl, ensureRuleFor, label
 // audio rendition, muxed together with ffmpeg.wasm) and returns a playable
 // file. Used both when the user picked an exact quality from the popup list
 // and as the "just get me something" fallback for a bare HLS URL.
-async function downloadHlsVariant(videoPlaylistUrl, audioPlaylistUrl, subtitleUrl, ensureRuleFor) {
-  const { bytes: videoBytes, hasInitSegment } = await downloadMediaPlaylistTrack(videoPlaylistUrl, ensureRuleFor, "video");
+async function downloadHlsVariant(videoPlaylistUrl, audioPlaylistUrl, subtitleUrl, ensureRuleFor, onProgress) {
+  // Tracks fill 0-90%; the rest is muxing and saving.
+  const span = audioPlaylistUrl ? 45 : 90;
+  const { bytes: videoBytes, hasInitSegment } = await downloadMediaPlaylistTrack(
+    videoPlaylistUrl,
+    ensureRuleFor,
+    "video",
+    (f) => onProgress?.(f * span)
+  );
 
   let audioBytes = null;
   if (audioPlaylistUrl) {
     console.log("[UVD] separate audio + video renditions detected, downloading both...");
-    audioBytes = (await downloadMediaPlaylistTrack(audioPlaylistUrl, ensureRuleFor, "audio")).bytes;
+    audioBytes = (
+      await downloadMediaPlaylistTrack(audioPlaylistUrl, ensureRuleFor, "audio", (f) => onProgress?.(span + f * span))
+    ).bytes;
   }
 
   let subtitleText = null;
@@ -1051,18 +1121,19 @@ async function downloadHlsVariant(videoPlaylistUrl, audioPlaylistUrl, subtitleUr
   }
 
   console.log("[UVD] muxing with ffmpeg.wasm...");
+  onProgress?.(95);
   return { blob: await muxTracks({ videoBytes, audioBytes, subtitleText }), ext: "mp4" };
 }
 
 // Fallback for an HLS entry with no pre-resolved quality info (e.g. the
 // popup classifier couldn't reach it) — fetch it fresh and auto-pick the
 // highest-bandwidth variant, same as before quality selection existed.
-async function downloadHls(playlistUrl, ensureRuleFor) {
+async function downloadHls(playlistUrl, ensureRuleFor, onProgress) {
   console.log("[UVD] fetching HLS playlist:", playlistUrl);
   const text = await (await fetchOrThrow(playlistUrl, { ensureRuleFor })).text();
 
   if (!text.includes("#EXT-X-STREAM-INF")) {
-    return downloadHlsVariant(playlistUrl, null, null, ensureRuleFor);
+    return downloadHlsVariant(playlistUrl, null, null, ensureRuleFor, onProgress);
   }
 
   const [best] = parseMasterVariants(text);
@@ -1072,7 +1143,7 @@ async function downloadHls(playlistUrl, ensureRuleFor) {
   const [defaultSub] = parseSubtitleTracks(text);
   const subtitleUrl = defaultSub ? new URL(defaultSub.uri, playlistUrl).href : null;
   console.log("[UVD] master playlist -> best variant:", videoPlaylistUrl);
-  return downloadHlsVariant(videoPlaylistUrl, audioPlaylistUrl, subtitleUrl, ensureRuleFor);
+  return downloadHlsVariant(videoPlaylistUrl, audioPlaylistUrl, subtitleUrl, ensureRuleFor, onProgress);
 }
 
 // --- Audio/video/subtitle muxing via an offscreen document (ffmpeg.wasm) -

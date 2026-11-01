@@ -96,13 +96,23 @@ function copyFfmpegCommand(video, btn) {
   });
 }
 
+// Background reports percent for whatever this popup started.
+let activeBtn = null;
+let activeTabId = null;
+chrome.runtime.onMessage.addListener((m) => {
+  if (m.action !== "downloadProgress" || m.percent == null || m.tabId !== activeTabId || !activeBtn) return;
+  activeBtn.textContent = `${activeBtn.textContent.split("…")[0]}… ${m.percent}%`;
+});
+
 function downloadVideo(video, btn) {
   btn.disabled = true;
   btn.textContent = "Downloading…";
+  activeBtn = btn;
   chrome.tabs.query({ active: true, currentWindow: true }, ([tab]) => {
+    activeTabId = tab.id;
     chrome.runtime.sendMessage({ action: "downloadVideo", tabId: tab.id, video }, (response) => {
       if (response?.pending) {
-        btn.textContent = "Recording… (see % on icon)";
+        btn.textContent = "Recording…";
       } else if (response?.success) {
         btn.textContent = "Saved ✓";
       } else {
