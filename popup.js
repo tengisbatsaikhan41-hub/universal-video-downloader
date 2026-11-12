@@ -125,12 +125,29 @@ function downloadVideo(video, btn) {
   });
 }
 
-chrome.tabs.query({ active: true, currentWindow: true }, ([tab]) => {
-  chrome.runtime.sendMessage({ action: "getVideos", tabId: tab.id }, (response) => {
-    const videos = response?.videos || [];
-    statusEl.textContent = videos.length
-      ? `${videos.length} video${videos.length > 1 ? "s" : ""} found`
-      : "No videos found yet — try playing the video first.";
-    render(videos);
+// `all` = false lists only the video being watched when the page preloads
+// others (Instagram/Facebook feeds); the background says how many it hid.
+function loadVideos(all) {
+  chrome.tabs.query({ active: true, currentWindow: true }, ([tab]) => {
+    chrome.runtime.sendMessage({ action: "getVideos", tabId: tab.id, all }, (response) => {
+      const videos = response?.videos || [];
+      const hidden = response?.hiddenCount || 0;
+      statusEl.textContent = videos.length
+        ? `${videos.length} video${videos.length > 1 ? "s" : ""} found${hidden ? " for the one you're watching" : ""}`
+        : "No videos found yet — try playing the video first.";
+      if (hidden) {
+        const showAll = document.createElement("button");
+        showAll.className = "show-all";
+        showAll.textContent = `Show ${hidden} other${hidden > 1 ? "s" : ""}`;
+        showAll.addEventListener("click", () => {
+          statusEl.textContent = "Loading…";
+          loadVideos(true);
+        });
+        statusEl.append(" · ", showAll);
+      }
+      render(videos);
+    });
   });
-});
+}
+
+loadVideos(false);

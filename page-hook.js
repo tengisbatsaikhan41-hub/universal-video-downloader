@@ -69,7 +69,7 @@
     const sig = fnv1a(initBytes);
     let rep = track.reps.get(sig);
     if (!rep) {
-      rep = { init: initBytes, mime: track.mime, frags: new Map(), unkeyed: [], bytes: 0 };
+      rep = { sig, init: initBytes, mime: track.mime, frags: new Map(), unkeyed: [], bytes: 0 };
       track.reps.set(sig, rep);
     }
     track.current = rep;
@@ -452,6 +452,26 @@
     }, 1000);
   }
 
+  // The <video> the viewer is watching: a playing one first, then whichever
+  // shows the most on screen. Feeds like Instagram's preload the reels
+  // around it into their own (paused, off-screen) players.
+  function watchedVideo() {
+    let best = null;
+    let bestScore = 0;
+    for (const v of document.querySelectorAll("video")) {
+      if (!tracksByUrl.has(v.src)) continue;
+      const r = v.getBoundingClientRect();
+      const w = Math.min(r.right, window.innerWidth) - Math.max(r.left, 0);
+      const h = Math.min(r.bottom, window.innerHeight) - Math.max(r.top, 0);
+      const score = Math.max(0, w) * Math.max(0, h) + (v.paused ? 0 : 1e9);
+      if (score > bestScore) {
+        best = v;
+        bestScore = score;
+      }
+    }
+    return best;
+  }
+
   window.addEventListener("message", (event) => {
     if (event.source !== window) return;
     const req = event.data?.__uvdRequest;
@@ -474,6 +494,12 @@
         "*",
         exported.map((t) => t.buffer)
       );
+    } else if (req === "getPlayingInitSigs") {
+      // Signatures of the init segments the watched video is playing from;
+      // background.js matches them against the files it detected.
+      const video = watchedVideo();
+      const sigs = video ? tracksByUrl.get(video.src).map((t) => t.current?.sig).filter(Boolean) : [];
+      window.postMessage({ __uvdResponse: "playingInitSigs", requestId: event.data.requestId, sigs }, "*");
     }
   });
 

@@ -58,3 +58,12 @@ button.ffmpeg-btn {
 }
 .cc-toggle { display: flex; align-items: center; gap: 3px; font-size: 12px; cursor: pointer; white-space: nowrap; }
 .empty { font-size: 12px; color: #888; text-align: center; padding: 20px 0; }
+.show-all {
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  color: #3448c5;
+  text-decoration: underline;
+  cursor: pointer;
+}

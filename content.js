@@ -180,7 +180,33 @@ async function stashBlob(blob, prefix) {
   return { mime: blob.type || "video/mp4", size: blob.size, chunkKeys };
 }
 
+// Which video the viewer is watching, as init-segment signatures from
+// page-hook.js (see getPlayingInitSigs there). Empty if it can't tell.
+function getPlayingInitSigs() {
+  return new Promise((resolve) => {
+    const requestId = Math.random().toString(36).slice(2);
+    const timeout = setTimeout(() => {
+      window.removeEventListener("message", onMessage);
+      resolve([]);
+    }, 2000);
+
+    function onMessage(event) {
+      if (event.source !== window || event.data?.__uvdResponse !== "playingInitSigs" || event.data.requestId !== requestId) return;
+      clearTimeout(timeout);
+      window.removeEventListener("message", onMessage);
+      resolve(event.data.sigs || []);
+    }
+
+    window.addEventListener("message", onMessage);
+    window.postMessage({ __uvdRequest: "getPlayingInitSigs", requestId }, "*");
+  });
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.action === "getPlayingInitSigs") {
+    getPlayingInitSigs().then((sigs) => sendResponse({ sigs }));
+    return true; // async
+  }
   if (message.action !== "startBlobCapture") return;
   // Answer right away: a full capture can take minutes, longer than the
   // background should sit on one pending message. The result comes back

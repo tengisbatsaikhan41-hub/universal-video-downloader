@@ -71,6 +71,7 @@ function upsertVideo(tabId, info) {
 }
 
 function clearTab(tabId) {
+  for (const url of tabVideos.get(tabId)?.keys() || []) initSigByUrl.delete(url);
   tabVideos.delete(tabId);
   tabTitles.delete(tabId);
   tabPageUrls.delete(tabId);
@@ -311,6 +312,123 @@ function parseRangedMp4(url) {
   };
 }
 
+// Their feeds also preload the reels before and after the one on screen, so
+// those get detected too. To list only the watched one, page-hook.js reports
+// the init segments (ftyp+moov) its <video> was fed, and we find the detected
+// file that starts with those same bytes.
+
+/** @type {Map<string, string>} full file URL -> init segment signature */
+const initSigByUrl = new Map();
+const INIT_PROBE_BYTES = 65536;
+
+function readU32(b, o) {
+  return b[o] * 0x1000000 + (b[o + 1] << 16) + (b[o + 2] << 8) + b[o + 3];
+}
+
+// Same as page-hook.js's fnv1a() over the parts joined together.
+function fnv1aSig(parts) {
+  let h = 0x811c9dc5;
+  let len = 0;
+  for (const p of parts) {
+    for (let i = 0; i < p.length; i++) {
+      h ^= p[i];
+      h = Math.imul(h, 0x01000193);
+    }
+    len += p.length;
+  }
+  return (h >>> 0).toString(16) + ":" + len;
+}
+
+// The signature page-hook.js's setInit() gives the same init segment.
+function mp4InitSig(b) {
+  let ftyp = null;
+  for (let off = 0; off + 8 <= b.length; ) {
+    let size = readU32(b, off);
+    if (size === 1 && off + 16 <= b.length) size = readU32(b, off + 8) * 4294967296 + readU32(b, off + 12);
+    if (size < 8 || off + size > b.length) return null;
+    const type = String.fromCharCode(b[off + 4], b[off + 5], b[off + 6], b[off + 7]);
+    if (type === "ftyp") ftyp = b.subarray(off, off + size);
+    else if (type === "moov") {
+      const moov = b.subarray(off, off + size);
+      return fnv1aSig(ftyp ? [ftyp, moov] : [moov]);
+    }
+    off += size;
+  }
+  return null;
+}
+
+async function fetchInitSig(url, ensureRuleFor) {
+  const u = new URL(url);
+  u.searchParams.set("bytestart", "0");
+  u.searchParams.set("byteend", String(INIT_PROBE_BYTES - 1));
+  const res = await fetchOrThrow(u.href, { ensureRuleFor });
+  // Stop reading at the probe size, in case the server sends the whole file.
+  const reader = res.body.getReader();
+  const bytes = new Uint8Array(INIT_PROBE_BYTES);
+  let total = 0;
+  while (total < INIT_PROBE_BYTES) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    const n = Math.min(value.length, INIT_PROBE_BYTES - total);
+    bytes.set(value.subarray(0, n), total);
+    total += n;
+  }
+  reader.cancel().catch(() => {});
+  return mp4InitSig(bytes.subarray(0, total));
+}
+
+async function findWatchedAssetId(tabId, candidates) {
+  const latest = candidates[candidates.length - 1];
+  const sigs = await new Promise((resolve) => {
+    chrome.tabs.sendMessage(tabId, { action: "getPlayingInitSigs" }, { frameId: latest.frameId > 0 ? latest.frameId : 0 }, (res) => {
+      void chrome.runtime.lastError; // no content script there — just can't tell
+      resolve(new Set(res?.sigs || []));
+    });
+  });
+  if (!sigs.size) return null;
+
+  return withRefererOverride(await getPageUrl(tabId), async (ensureRuleFor) => {
+    // Newest first: the watched reel is usually among the latest requests.
+    const queue = candidates.slice().reverse();
+    let found = null;
+    async function worker() {
+      while (!found && queue.length) {
+        const v = queue.shift();
+        let sig = initSigByUrl.get(v.url);
+        if (!sig) {
+          sig = await fetchInitSig(v.url, ensureRuleFor).catch((err) => console.warn("[UVD] init probe failed:", err.message));
+          if (sig) initSigByUrl.set(v.url, sig);
+        }
+        if (sig && sigs.has(sig)) found = v.assetId;
+      }
+    }
+    await Promise.all(Array.from({ length: MAX_SEGMENT_CONCURRENCY }, worker));
+    return found;
+  });
+}
+
+async function listVideos(tabId, all) {
+  let list = Array.from(tabVideos.get(tabId)?.values() || []).sort(
+    (a, b) => (a.detectedAt || 0) - (b.detectedAt || 0)
+  );
+  const pageTitle = tabTitles.get(tabId) || "";
+  const candidates = list.filter((v) => v.assetId);
+  if (candidates.length === 0) return { videos: list, pageTitle };
+
+  // Blob capture plays the video at 8x, so Instagram's player drops to its
+  // lowest quality; the full-file entries are always better there.
+  list = list.filter((v) => v.type !== "blob");
+  if (all) return { videos: list, pageTitle };
+
+  const assetId = await findWatchedAssetId(tabId, candidates).catch((err) => {
+    console.warn("[UVD] could not tell which video is being watched:", err.message);
+    return null;
+  });
+  if (!assetId) return { videos: list, pageTitle };
+  const watched = list.filter((v) => v.assetId === assetId).sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+  return { videos: watched, pageTitle, hiddenCount: list.length - watched.length };
+}
+
 function handleRangedMp4(details) {
   const r = parseRangedMp4(details.url);
   if (!r) return false;
@@ -338,6 +456,7 @@ function handleRangedMp4(details) {
     size: null, // the response is one piece, not the whole file
     frameId: details.frameId,
     assetId: r.assetId,
+    bitrate: r.bitrate,
     audioUrl,
     label,
   });
@@ -441,15 +560,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.action === "getVideos") {
-    const tabId = message.tabId;
-    let list = Array.from(tabVideos.get(tabId)?.values() || []).sort(
-      (a, b) => (a.detectedAt || 0) - (b.detectedAt || 0)
-    );
-    // Blob capture plays the video at 8x, so Instagram's player drops to its
-    // lowest quality; the full-file entries are always better there.
-    if (list.some((v) => v.assetId)) list = list.filter((v) => v.type !== "blob");
-    sendResponse({ videos: list, pageTitle: tabTitles.get(tabId) || "" });
-    return;
+    listVideos(message.tabId, message.all).then(sendResponse);
+    return true; // async
   }
 
   if (message.action === "captureProgress") {
