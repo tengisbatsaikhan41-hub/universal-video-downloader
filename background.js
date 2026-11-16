@@ -45,7 +45,8 @@ const activeProgress = new Map();
 
 function updateBadge(tabId) {
   const count = tabVideos.get(tabId)?.size || 0;
-  const pct = activeProgress.get(tabId);
+  // Other tabs show the latest running download too, so switching tabs doesn't hide it.
+  const pct = activeProgress.get(tabId) ?? Array.from(activeProgress.values()).pop();
   chrome.action.setBadgeText({ tabId, text: pct != null ? `${pct}%` : count ? String(count) : "" });
   chrome.action.setBadgeBackgroundColor({ tabId, color: "#d9534f" });
 }
@@ -58,7 +59,7 @@ function setProgress(tabId, percent) {
   if ((activeProgress.get(tabId) ?? null) === next) return;
   if (next == null) activeProgress.delete(tabId);
   else activeProgress.set(tabId, next);
-  updateBadge(tabId);
+  chrome.tabs.query({}, (tabs) => tabs.forEach((t) => updateBadge(t.id)));
   chrome.runtime.sendMessage({ action: "downloadProgress", tabId, percent: next }).catch(() => {});
 }
 
