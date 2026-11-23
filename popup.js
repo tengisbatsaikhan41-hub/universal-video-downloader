@@ -132,9 +132,11 @@ function loadVideos(all) {
     chrome.runtime.sendMessage({ action: "getVideos", tabId: tab.id, all }, (response) => {
       const videos = response?.videos || [];
       const hidden = response?.hiddenCount || 0;
-      statusEl.textContent = videos.length
-        ? `${videos.length} video${videos.length > 1 ? "s" : ""} found${hidden ? " for the one you're watching" : ""}`
-        : "No videos found yet — try playing the video first.";
+      statusEl.textContent = hidden
+        ? "The video you're watching"
+        : videos.length
+          ? `${videos.length} video${videos.length > 1 ? "s" : ""} found`
+          : "No videos found yet — try playing the video first.";
       if (hidden) {
         const showAll = document.createElement("button");
         showAll.className = "show-all";

@@ -202,9 +202,28 @@ function getPlayingInitSigs() {
   });
 }
 
+// The <video> the viewer is watching: a playing one first, then whichever
+// shows the most on screen (the same rule as watchedVideo in page-hook.js).
+function watchedVideo() {
+  let best = null;
+  let bestScore = 0;
+  for (const v of document.querySelectorAll("video")) {
+    const r = v.getBoundingClientRect();
+    const w = Math.min(r.right, window.innerWidth) - Math.max(r.left, 0);
+    const h = Math.min(r.bottom, window.innerHeight) - Math.max(r.top, 0);
+    const score = Math.max(0, w) * Math.max(0, h) + (v.paused ? 0 : 1e9);
+    if (score > bestScore) {
+      best = v;
+      bestScore = score;
+    }
+  }
+  return best;
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (message.action === "getPlayingInitSigs") {
-    getPlayingInitSigs().then((sigs) => sendResponse({ sigs }));
+  if (message.action === "getWatchedVideo") {
+    const duration = watchedVideo()?.duration;
+    getPlayingInitSigs().then((sigs) => sendResponse({ duration: Number.isFinite(duration) ? duration : null, sigs }));
     return true; // async
   }
   if (message.action !== "startBlobCapture") return;

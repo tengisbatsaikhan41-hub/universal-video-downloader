@@ -43,8 +43,16 @@ function getTabMap(tabId) {
 /** @type {Map<number, number>} tabId -> percent of the download running for that tab */
 const activeProgress = new Map();
 
+// What the popup lists. On feeds with per-reel files (Instagram/Facebook)
+// that's one reel, not every preloaded reel and every quality of it.
+function badgeCount(tabId) {
+  const list = Array.from(tabVideos.get(tabId)?.values() || []);
+  if (!list.some((v) => v.assetId)) return list.length;
+  return list.filter((v) => !v.assetId && v.type !== "blob").length + 1;
+}
+
 function updateBadge(tabId) {
-  const count = tabVideos.get(tabId)?.size || 0;
+  const count = badgeCount(tabId);
   // Other tabs show the latest running download too, so switching tabs doesn't hide it.
   const pct = activeProgress.get(tabId) ?? Array.from(activeProgress.values()).pop();
   chrome.action.setBadgeText({ tabId, text: pct != null ? `${pct}%` : count ? String(count) : "" });
@@ -310,13 +318,16 @@ function parseRangedMp4(url) {
     isAudio: /audio/i.test(tag),
     assetId: efg.xpv_asset_id != null ? String(efg.xpv_asset_id) : efg.video_id != null ? String(efg.video_id) : null,
     bitrate: Number(efg.bitrate) || null,
+    durationS: Number(efg.duration_s) || null,
   };
 }
 
 // Their feeds also preload the reels before and after the one on screen, so
-// those get detected too. To list only the watched one, page-hook.js reports
-// the init segments (ftyp+moov) its <video> was fed, and we find the detected
-// file that starts with those same bytes.
+// those get detected too. To list only the watched one: the playing <video>'s
+// length usually singles it out (efg carries each file's duration_s). If
+// several reels share that length, page-hook.js reports the init segments
+// (ftyp+moov) its <video> was fed, and we find the detected file that starts
+// with those same bytes.
 
 /** @type {Map<string, string>} full file URL -> init segment signature */
 const initSigByUrl = new Map();
@@ -380,17 +391,24 @@ async function fetchInitSig(url, ensureRuleFor) {
 
 async function findWatchedAssetId(tabId, candidates) {
   const latest = candidates[candidates.length - 1];
-  const sigs = await new Promise((resolve) => {
-    chrome.tabs.sendMessage(tabId, { action: "getPlayingInitSigs" }, { frameId: latest.frameId > 0 ? latest.frameId : 0 }, (res) => {
+  const watched = await new Promise((resolve) => {
+    chrome.tabs.sendMessage(tabId, { action: "getWatchedVideo" }, { frameId: latest.frameId > 0 ? latest.frameId : 0 }, (res) => {
       void chrome.runtime.lastError; // no content script there — just can't tell
-      resolve(new Set(res?.sigs || []));
+      resolve(res || {});
     });
   });
+
+  const sameLength = Number.isFinite(watched.duration)
+    ? candidates.filter((v) => v.durationS != null && Math.abs(v.durationS - watched.duration) <= 1)
+    : [];
+  if (new Set(sameLength.map((v) => v.assetId)).size === 1) return sameLength[0].assetId;
+
+  const sigs = new Set(watched.sigs || []);
   if (!sigs.size) return null;
 
   return withRefererOverride(await getPageUrl(tabId), async (ensureRuleFor) => {
     // Newest first: the watched reel is usually among the latest requests.
-    const queue = candidates.slice().reverse();
+    const queue = (sameLength.length ? sameLength : candidates).slice().reverse();
     let found = null;
     async function worker() {
       while (!found && queue.length) {
@@ -418,7 +436,7 @@ async function listVideos(tabId, all) {
 
   // Blob capture plays the video at 8x, so Instagram's player drops to its
   // lowest quality; the full-file entries are always better there.
-  list = list.filter((v) => v.type !== "blob");
+  list = bestPerAsset(list.filter((v) => v.type !== "blob"));
   if (all) return { videos: list, pageTitle };
 
   const assetId = await findWatchedAssetId(tabId, candidates).catch((err) => {
@@ -426,8 +444,20 @@ async function listVideos(tabId, all) {
     return null;
   });
   if (!assetId) return { videos: list, pageTitle };
-  const watched = list.filter((v) => v.assetId === assetId).sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-  return { videos: watched, pageTitle, hiddenCount: list.length - watched.length };
+  return { videos: list.filter((v) => v.assetId === assetId), pageTitle, hiddenCount: list.length - 1 };
+}
+
+// One download per reel: its best file — one with its audio paired over a
+// silent one, then the highest bitrate.
+function bestPerAsset(list) {
+  const best = new Map();
+  for (const v of list) {
+    if (!v.assetId) continue;
+    const cur = best.get(v.assetId);
+    const better = cur && (!!v.audioUrl - !!cur.audioUrl || (v.bitrate || 0) - (cur.bitrate || 0)) > 0;
+    if (!cur || better) best.set(v.assetId, v);
+  }
+  return list.filter((v) => !v.assetId || best.get(v.assetId) === v);
 }
 
 function handleRangedMp4(details) {
@@ -458,6 +488,7 @@ function handleRangedMp4(details) {
     frameId: details.frameId,
     assetId: r.assetId,
     bitrate: r.bitrate,
+    durationS: r.durationS,
     audioUrl,
     label,
   });
